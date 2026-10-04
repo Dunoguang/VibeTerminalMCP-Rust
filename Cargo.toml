@@ -1,0 +1,24 @@
+[package]
+name = "vibeterminalmcp-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vibeterminalmcp-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+nix = { version = "0.29", features = ["term", "process", "signal", "ioctl", "fs"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+strip = true
