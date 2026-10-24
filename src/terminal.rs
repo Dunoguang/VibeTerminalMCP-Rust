@@ -295,10 +295,14 @@ impl TerminalSession {
 
         let mut end = floor_boundary(&buf.data, start + limit);
         if end <= start { end = ceil_boundary(&buf.data, start + 1); }
-        // Prefer to stop on a line boundary so callers never get half a line.
+        // Prefer to stop on a line boundary so callers never get half a line,
+        // but never rewind more than 4 KB. Output without newlines (base64,
+        // minified JSON) used to collapse the whole page to the first line.
         if end < buf.data.len() {
             if let Some(p) = buf.data[start..end].rfind('\n') {
-                if p > 0 { end = start + p + 1; }
+                if p > 0 && end - (start + p + 1) <= 4096 {
+                    end = start + p + 1;
+                }
             }
         }
 
@@ -352,8 +356,11 @@ impl TerminalSession {
             let marker = format!("__DONE_{tag}__");
             let marker_exit = format!("{marker}:");
 
-            // Ctrl+U clears any pending input before the marker command.
-            self.write(&format!("\x15echo {marker}:$?\n"));
+            // Do not send Ctrl+U here. It can erase a command that add_cmd
+            // just wrote but the shell has not consumed yet, which showed up
+            // as random empty results. Every tool write ends with a newline,
+            // so there is normally nothing to clear anyway.
+            self.write(&format!("echo {marker}:$?\n"));
 
             // written is monotonic, so a saturated ring buffer no longer looks
             // "idle" the way a plain length comparison did.
