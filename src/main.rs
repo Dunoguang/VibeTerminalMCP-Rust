@@ -43,6 +43,15 @@ fn main() {
     let state = AppState::new();
 
     tracing::info!("audit log: {}", audit_path().display());
+    // Reap sessions whose shell has exited. Without this the map only grows.
+    {
+        let st = state.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            st.cleanup_dead();
+        });
+    }
+
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

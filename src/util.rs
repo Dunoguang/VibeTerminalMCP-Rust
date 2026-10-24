@@ -101,6 +101,40 @@ pub fn finalize_output(mut s: String) -> String {
     s
 }
 
+pub const MAX_TAKE_BYTES: usize = 1024 * 1024;
+
+fn floor_char(s: &str, mut i: usize) -> usize {
+    if i >= s.len() { return s.len(); }
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
+}
+
+// Tail-clipped output with a caller supplied limit (default path stays 4 KB).
+pub fn finalize_output_limit(mut s: String, limit: usize) -> String {
+    s = strip_ansi(&s);
+    s = String::from_utf8_lossy(s.as_bytes()).into_owned();
+    let limit = limit.max(256);
+    if s.len() > limit {
+        let start = floor_char(&s, s.len() - limit);
+        s = format!("===truncated {} bytes===\n{}", start, &s[start..]);
+    }
+    s
+}
+
+// Head-clipped output: keep the first `limit` bytes. Used by terminal_line,
+// where the caller asked for an explicit range and wants its beginning.
+pub fn clip_head(mut s: String, limit: usize) -> String {
+    s = strip_ansi(&s);
+    s = String::from_utf8_lossy(s.as_bytes()).into_owned();
+    let limit = limit.max(256);
+    if s.len() > limit {
+        let end = floor_char(&s, limit);
+        s = format!("{}\n=== {} bytes follow ===", &s[..end], s.len() - end);
+    }
+    s
+}
+
+
 // ── Timestamp ────────────────────────────────────────────────────────────────
 
 pub fn now_ms() -> i64 {

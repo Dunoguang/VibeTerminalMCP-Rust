@@ -1,22 +1,71 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::os::unix::io::{RawFd};
+use std::os::unix::io::RawFd;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration};
+use std::time::Duration;
 
-use libc::{c_int, c_ushort, pid_t, winsize, termios};
+use libc::{c_int, c_ushort, pid_t, termios, winsize};
 use rand::Rng;
 use tracing::{info, warn};
 
 use crate::util::{now_ms, strip_ansi};
 
-const BUF_MAX: usize = 64 * 1024; // 64 KB 环形缓冲
-const POLL_MS: i32 = 100;
+// -- Tunables ----------------------------------------------------------------
+// Window of output kept per session. The old 64 KB window silently cut the
+// head off ordinary command output (dmesg, build logs) and even left a
+// truncated first line, so the window is now large enough for real work.
+const BUF_MAX: usize = 4 * 1024 * 1024;
+// Compact only after overflowing by this much, so a burst of output costs one
+// memmove instead of one per read().
+const BUF_SLACK: usize = 512 * 1024;
+// Bytes per read(). The reader drains the tty until it is empty, otherwise the
+// kernel-side pty buffer (usually 64 KB) stays full and blocks the writer.
+// That back-pressure is the real "pty squeeze".
+const READ_CHUNK: usize = 128 * 1024;
+const POLL_MS: i32 = 50;
 const MAX_WAIT_MS: i64 = 115000;
+pub const DEFAULT_TAKE: usize = 4096;
 
-// ── TerminalSession ──────────────────────────────────────────────────────────
+// -- UTF-8 helpers -----------------------------------------------------------
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() { return s.len(); }
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() { return s.len(); }
+    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+    i
+}
+
+fn tail_str(s: &str, n: usize) -> &str {
+    let start = floor_boundary(s, s.len().saturating_sub(n));
+    &s[start..]
+}
+
+// Split the longest valid UTF-8 prefix from buf.
+// Returns (bytes consumed, decoded text). An incomplete trailing multi-byte
+// sequence is left in buf for the next read so characters split across read()
+// boundaries are not turned into U+FFFD.
+fn split_valid_prefix(buf: &[u8]) -> (usize, String) {
+    match std::str::from_utf8(buf) {
+        Ok(s) => (buf.len(), s.to_string()),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            let text = String::from_utf8_lossy(&buf[..valid]).into_owned();
+            match e.error_len() {
+                Some(n) => (valid + n, text),
+                None => (valid, text),
+            }
+        }
+    }
+}
+
+// -- TerminalSession ---------------------------------------------------------
 
 pub struct TerminalSession {
     pub id: String,
@@ -34,7 +83,13 @@ struct SessionState {
 
 struct BufState {
     data: String,
+    // next byte the incremental reader has not returned yet
     last_read_pos: usize,
+    // monotonic counters; compaction never resets them
+    written: u64,
+    dropped: u64,
+    // last dropped value seen by the reader API, for the loss notice
+    seen_dropped: u64,
 }
 
 impl TerminalSession {
@@ -45,14 +100,14 @@ impl TerminalSession {
         cwd: Option<String>,
         extra_env: Vec<(String, String)>,
     ) -> Result<Arc<Self>, String> {
-        // 构建 termios (显式交互式配置，移除 ISTRIP 保证 UTF-8 正常)
+        // Explicit interactive termios: no ISTRIP, keep IUTF8 so UTF-8 works.
         let mut tio: termios = unsafe { std::mem::zeroed() };
         tio.c_iflag = (libc::ICRNL | libc::IXON | libc::IUTF8 | libc::BRKINT) as _;
         tio.c_oflag = (libc::OPOST | libc::ONLCR) as _;
         tio.c_cflag = (libc::B38400 | libc::CS8 | libc::CREAD) as _;
         tio.c_lflag = (libc::ISIG | libc::ICANON | libc::ECHO | libc::ECHOE | libc::ECHOK | libc::IEXTEN) as _;
         tio.c_cc[libc::VINTR] = 0x03;  // ^C
-        tio.c_cc[libc::VQUIT] = 0x1c;  // ^\
+        tio.c_cc[libc::VQUIT] = 0x1c;  // ^backslash
         tio.c_cc[libc::VERASE] = 0x7f; // DEL
         tio.c_cc[libc::VKILL] = 0x15;  // ^U
         tio.c_cc[libc::VEOF] = 0x04;   // ^D
@@ -76,12 +131,12 @@ impl TerminalSession {
         }
 
         if pid == 0 {
-            // ── 子进程 ──
+            // -- child --
             if let Some(ref d) = cwd {
                 let _ = std::env::set_current_dir(d);
             }
 
-            // 重置信号处置 (exec 会保留 SIG_IGN，恢复默认处置让 Ctrl+C 有效)
+            // Reset signal dispositions (exec keeps SIG_IGN, which breaks ^C).
             unsafe {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
                 libc::signal(libc::SIGQUIT, libc::SIG_DFL);
@@ -92,7 +147,6 @@ impl TerminalSession {
                 libc::signal(libc::SIGHUP, libc::SIG_DFL);
             }
 
-            // 环境变量
             let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
             std::env::set_var("TERM", term);
             for (k, v) in &extra_env {
@@ -115,11 +169,17 @@ impl TerminalSession {
             }
         }
 
-        // ── 父进程 ──
+        // -- parent --
         let state = Arc::new(SessionState {
             alive: std::sync::atomic::AtomicBool::new(true),
             last_activity: std::sync::atomic::AtomicI64::new(now_ms()),
-            buf: Mutex::new(BufState { data: String::new(), last_read_pos: 0 }),
+            buf: Mutex::new(BufState {
+                data: String::new(),
+                last_read_pos: 0,
+                written: 0,
+                dropped: 0,
+                seen_dropped: 0,
+            }),
             buf_cv: std::sync::Condvar::new(),
         });
 
@@ -130,7 +190,6 @@ impl TerminalSession {
             state: Arc::clone(&state),
         });
 
-        // 读线程
         let state2 = Arc::clone(&state);
         let master_fd = master;
         let id_cloned = id.clone();
@@ -143,7 +202,7 @@ impl TerminalSession {
         Ok(session)
     }
 
-    /// 向前台进程组发信号 (从 /proc/<bash_pid>/stat 读 tpgid)
+    // Send a signal to the foreground process group (tpgid of the shell).
     pub fn signal_fg(&self, sig: c_int) -> bool {
         let stat_path = format!("/proc/{}/stat", self.pid);
         let Ok(file) = File::open(&stat_path) else {
@@ -156,7 +215,7 @@ impl TerminalSession {
 
         let Some(rp) = line.rfind(')') else { return false; };
         let parts: Vec<&str> = line[rp + 1..].split_whitespace().collect();
-        // 字段索引: 0:state, 1:ppid, 2:pgrp, 3:session, 4:tty_nr, 5:tpgid
+        // fields: 0 state, 1 ppid, 2 pgrp, 3 session, 4 tty_nr, 5 tpgid
         if parts.len() < 6 { return false; }
         let Ok(tpgid) = parts[5].parse::<pid_t>() else { return false; };
         if tpgid <= 0 {
@@ -174,7 +233,7 @@ impl TerminalSession {
         true
     }
 
-    /// 写输入到 pty (支持控制字符映射)
+    // Write input to the pty (control characters are mapped to signals).
     pub fn write(&self, data: &str) {
         if !self.alive() { return; }
         let mut rest = Vec::new();
@@ -184,7 +243,7 @@ impl TerminalSession {
             match b {
                 0x03 => { self.signal_fg(libc::SIGINT);  has_ctrl = true; } // ^C
                 0x1a => { self.signal_fg(libc::SIGTSTP); has_ctrl = true; } // ^Z
-                0x1c => { self.signal_fg(libc::SIGQUIT); has_ctrl = true; } // ^\
+                0x1c => { self.signal_fg(libc::SIGQUIT); has_ctrl = true; } // ^backslash
                 _ => rest.push(b),
             }
         }
@@ -209,33 +268,65 @@ impl TerminalSession {
         if has_ctrl {
             thread::sleep(Duration::from_millis(300));
         }
-        self.state.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        self.state.last_activity.store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn read_all(&self) -> String {
         self.state.buf.lock().unwrap().data.clone()
     }
 
-    pub fn read_last(&self) -> String {
+    // Incremental read: return up to max_bytes of not-yet-returned output, in
+    // order. Returns (text, bytes_still_unread, bytes_dropped_since_last_read).
+    // The cursor only advances over what was actually returned, so a large
+    // burst can be paged with repeated calls instead of being thrown away.
+    pub fn read_last(&self, max_bytes: usize) -> (String, usize, u64) {
+        let limit = if max_bytes == 0 { DEFAULT_TAKE } else { max_bytes };
         let mut buf = self.state.buf.lock().unwrap();
-        let pos = buf.last_read_pos;
-        let out = buf.data[pos..].to_string();
-        buf.last_read_pos = buf.data.len();
-        out
+        let start = floor_boundary(&buf.data, buf.last_read_pos);
+        buf.last_read_pos = start;
+
+        let dropped = buf.dropped.saturating_sub(buf.seen_dropped);
+        buf.seen_dropped = buf.dropped;
+
+        let remaining = buf.data.len().saturating_sub(start);
+        if remaining == 0 {
+            return (String::new(), 0, dropped);
+        }
+
+        let mut end = floor_boundary(&buf.data, start + limit);
+        if end <= start { end = ceil_boundary(&buf.data, start + 1); }
+        // Prefer to stop on a line boundary so callers never get half a line.
+        if end < buf.data.len() {
+            if let Some(p) = buf.data[start..end].rfind('\n') {
+                if p > 0 { end = start + p + 1; }
+            }
+        }
+
+        let out = buf.data[start..end].to_string();
+        buf.last_read_pos = end;
+        let left = buf.data.len().saturating_sub(end);
+        (out, left, dropped)
     }
 
     pub fn read_lines(&self, a: usize, b: usize) -> String {
         let buf = self.state.buf.lock().unwrap();
         if a < 1 { return "(no output)".into(); }
-        let lines: Vec<&str> = buf.data.split('\n').collect();
-        let total = lines.len();
-        let lo = a.saturating_sub(1).min(total);
-        let hi = b.min(total);
-        if lo >= hi { return "(no output)".into(); }
-        lines[lo..hi].join("\n")
+        // Walk the lines without building a Vec of every line in the buffer.
+        let mut out = String::new();
+        let mut found = false;
+        let mut idx = 0usize;
+        for line in buf.data.split('\n') {
+            idx += 1;
+            if idx < a { continue; }
+            if b != usize::MAX && idx > b { break; }
+            if found { out.push('\n'); }
+            out.push_str(line);
+            found = true;
+        }
+        if !found { "(no output)".into() } else { out }
     }
 
-    /// marker 模式等待 (10-02 重构全缓冲搜索版)
+    // marker mode: send "echo __DONE_x__:$?" and wait for the numeric exit code
     pub fn wait_marker(&self, mut timeout_ms: i64) -> (bool, String, i32) {
         if timeout_ms <= 0 || timeout_ms > MAX_WAIT_MS { timeout_ms = MAX_WAIT_MS; }
         const MAX_ATTEMPTS: usize = 3;
@@ -243,7 +334,7 @@ impl TerminalSession {
         if per_attempt < 1000 { per_attempt = timeout_ms; }
 
         let mut found = false;
-        let mut ec = -1;
+        let mut ec: i32 = -1;
 
         for _attempt in 0..MAX_ATTEMPTS {
             if found { break; }
@@ -254,74 +345,78 @@ impl TerminalSession {
             let marker = format!("__DONE_{tag}__");
             let marker_exit = format!("{marker}:");
 
-            // 发送 marker 命令 (先发 \x15 = Ctrl+U 清除前台输入行)
+            // Ctrl+U clears any pending input before the marker command.
             self.write(&format!("\x15echo {marker}:$?\n"));
 
-            let mut last_size = self.state.buf.lock().unwrap().data.len();
+            // written is monotonic, so a saturated ring buffer no longer looks
+            // "idle" the way a plain length comparison did.
+            let mut last_written = self.state.buf.lock().unwrap().written;
             let deadline = now_ms() + per_attempt;
 
             while now_ms() < deadline && self.alive() {
-                let buf_data = {
+                let hit = {
                     let guard = self.state.buf.lock().unwrap();
                     let (guard, _) = self.state.buf_cv
                         .wait_timeout_while(guard, Duration::from_millis(200), |b| {
-                            b.data.len() == last_size && self.alive()
+                            b.written == last_written && self.alive()
                         })
                         .unwrap();
-                    last_size = guard.data.len();
-                    guard.data.clone()
-                };
+                    last_written = guard.written;
 
-                // 全缓冲循环搜索：跳过命令回显中的 marker:$?，找到真实的数字退出码
-                let mut search = 0;
-                while let Some(pos) = buf_data[search..].find(&marker_exit) {
-                    let abs_pos = search + pos;
-                    let after = &buf_data[abs_pos + marker_exit.len()..];
-                    // 解析数字
-                    let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    if let Ok(val) = num_str.parse::<i32>() {
-                        ec = val;
-                        found = true;
-                        break;
+                    // The marker is near the tail. Scanning only the newest
+                    // 1 MB avoids re-walking a 4 MB buffer every 200 ms.
+                    let data = &guard.data;
+                    let start = floor_boundary(data, data.len().saturating_sub(1024 * 1024));
+                    let mut hit: Option<i32> = None;
+                    let mut search = start;
+                    while let Some(pos) = data[search..].find(&marker_exit) {
+                        let abs_pos = search + pos;
+                        let after = &data[abs_pos + marker_exit.len()..];
+                        let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(val) = num_str.parse::<i32>() {
+                            hit = Some(val);
+                            break;
+                        }
+                        search = abs_pos + 1;
                     }
-                    search = abs_pos + 1;
-                }
-                if found { break; }
+                    hit
+                };
+                if let Some(v) = hit { ec = v; found = true; break; }
             }
         }
 
-        // 取尾部最多 4096 字节
         let out = {
             let buf = self.state.buf.lock().unwrap();
-            let len = buf.data.len();
-            if len <= 4096 { buf.data.clone() } else { buf.data[len - 4096..].to_string() }
+            tail_str(&buf.data, DEFAULT_TAKE).to_string()
         };
-
         (found, out, ec)
     }
 
-    /// prompt 模式等待
+    // prompt mode: wait until the last output line ends with a shell prompt
     pub fn wait_prompt(&self, mut timeout_ms: i64) -> (bool, String) {
         if timeout_ms <= 0 || timeout_ms > MAX_WAIT_MS { timeout_ms = MAX_WAIT_MS; }
-        let init_len = self.state.buf.lock().unwrap().data.len();
+        let mut last_written = self.state.buf.lock().unwrap().written;
         let deadline = now_ms() + timeout_ms;
         let mut found = false;
 
         while now_ms() < deadline && self.alive() {
-            let buf_data = {
+            let last_line = {
                 let guard = self.state.buf.lock().unwrap();
                 let (guard, _) = self.state.buf_cv
                     .wait_timeout_while(guard, Duration::from_millis(200), |b| {
-                        b.data.len() == init_len && self.alive()
+                        b.written == last_written && self.alive()
                     })
                     .unwrap();
-                guard.data.clone()
+                last_written = guard.written;
+                let tail = tail_str(&guard.data, 1024);
+                strip_ansi(tail)
+                    .trim_end_matches('\n')
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end()
+                    .to_string()
             };
-
-            // 取最后 1024 字节找提示符 (剥离 ANSI 避免干扰)
-            let tail_start = buf_data.len().saturating_sub(1024);
-            let tail = strip_ansi(&buf_data[tail_start..]);
-            let last_line = tail.trim_end_matches('\n').rsplit('\n').next().unwrap_or("").trim_end();
             if let Some(c) = last_line.chars().last() {
                 if matches!(c, '$' | '#' | '>' | ':' | '%') {
                     found = true;
@@ -332,10 +427,8 @@ impl TerminalSession {
 
         let out = {
             let buf = self.state.buf.lock().unwrap();
-            let len = buf.data.len();
-            if len <= 4096 { buf.data.clone() } else { buf.data[len - 4096..].to_string() }
+            tail_str(&buf.data, DEFAULT_TAKE).to_string()
         };
-
         (found, out)
     }
 
@@ -352,19 +445,18 @@ impl TerminalSession {
     }
 
     pub fn alive(&self) -> bool {
-        self.state.alive.load(std::sync::atomic::Ordering::Relaxed)
+        self.state.alive.load(Ordering::Relaxed)
     }
 
     pub fn last_activity_ms(&self) -> i64 {
-        self.state.last_activity.load(std::sync::atomic::Ordering::Relaxed)
+        self.state.last_activity.load(Ordering::Relaxed)
     }
 
     pub fn close(&self) {
-        if !self.state.alive.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if !self.state.alive.swap(false, Ordering::SeqCst) {
             return;
         }
         self.state.buf_cv.notify_all();
-        // 写 exit + 等待 100ms
         unsafe {
             let _ = libc::write(self.master_fd, b"exit\n".as_ptr() as _, 5);
         }
@@ -385,9 +477,14 @@ impl Drop for TerminalSession {
     }
 }
 
+// -- reader thread -----------------------------------------------------------
+// Drains the pty until it is empty on every wakeup, then appends to the ring
+// window. Partial UTF-8 sequences are carried across read() boundaries.
 fn reader_loop(master_fd: RawFd, state: Arc<SessionState>, id: String) {
-    let mut raw = [0u8; 8192];
-    while state.alive.load(std::sync::atomic::Ordering::Relaxed) {
+    let mut raw = vec![0u8; READ_CHUNK];
+    let mut pending: Vec<u8> = Vec::new();
+
+    'outer: while state.alive.load(Ordering::Relaxed) {
         let mut pfd = libc::pollfd {
             fd: master_fd,
             events: libc::POLLIN,
@@ -399,33 +496,80 @@ fn reader_loop(master_fd: RawFd, state: Arc<SessionState>, id: String) {
             if err == libc::EINTR { continue; }
             break;
         }
-        if pr > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP)) != 0 {
-            let n = unsafe {
-                libc::read(master_fd, raw.as_mut_ptr() as _, raw.len())
-            };
-            if n <= 0 { break; }
-            let chunk = String::from_utf8_lossy(&raw[..n as usize]).into_owned();
-            state.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-            let mut buf = state.buf.lock().unwrap();
-            buf.data.push_str(&chunk);
-            // 环形缓冲：超 64KB 丢弃头部
-            if buf.data.len() > BUF_MAX {
-                let drop_bytes = buf.data.len() - BUF_MAX;
-                buf.last_read_pos = buf.last_read_pos.saturating_sub(drop_bytes);
-                let mut start = drop_bytes;
-                while start < buf.data.len() && !buf.data.is_char_boundary(start) { start += 1; }
-                buf.data = buf.data[start..].to_string();
-            }
-            drop(buf);
-            state.buf_cv.notify_all();
+        if pr == 0 { continue; }
+        if (pfd.revents & (libc::POLLIN | libc::POLLHUP)) == 0 {
+            if (pfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0 { break; }
+            continue;
         }
+
+        let mut eof = false;
+        loop {
+            let n = unsafe { libc::read(master_fd, raw.as_mut_ptr() as _, raw.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EINTR { continue; }
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK { break; }
+                eof = true;
+                break;
+            }
+            if n == 0 { eof = true; break; }
+
+            pending.extend_from_slice(&raw[..n as usize]);
+            let (consumed, text) = split_valid_prefix(&pending);
+            if consumed > 0 { pending.drain(..consumed); }
+            if !text.is_empty() {
+                append_output(&state, &text);
+            }
+
+            // A long run of invalid bytes (binary output) would otherwise pile
+            // up forever; flush it lossily once it grows past 8 KB.
+            if pending.len() > 8192 {
+                let text = String::from_utf8_lossy(&pending).into_owned();
+                pending.clear();
+                if !text.is_empty() { append_output(&state, &text); }
+            }
+
+            // Keep reading while data is already queued. This is what stops
+            // the kernel pty buffer from filling up and blocking the writer.
+            let mut p2 = libc::pollfd {
+                fd: master_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let more = unsafe { libc::poll(&mut p2, 1, 0) };
+            if more <= 0 || (p2.revents & libc::POLLIN) == 0 { break; }
+        }
+
+        state.last_activity.store(now_ms(), Ordering::Relaxed);
+        if eof { break 'outer; }
     }
-    state.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    state.alive.store(false, Ordering::SeqCst);
     state.buf_cv.notify_all();
     info!("terminal reader {id} finished");
 }
 
-// ── TerminalManager ──────────────────────────────────────────────────────────
+fn append_output(state: &SessionState, text: &str) {
+    let mut buf = state.buf.lock().unwrap();
+    buf.data.push_str(text);
+    buf.written = buf.written.saturating_add(text.len() as u64);
+
+    if buf.data.len() > BUF_MAX + BUF_SLACK {
+        // Keep the newest BUF_MAX bytes; cut on a character boundary and move
+        // the read cursor back by exactly what was removed.
+        let mut drop_to = buf.data.len() - BUF_MAX;
+        drop_to = ceil_boundary(&buf.data, drop_to);
+        if drop_to > 0 {
+            buf.data.drain(..drop_to);
+            buf.dropped = buf.dropped.saturating_add(drop_to as u64);
+            buf.last_read_pos = floor_boundary(&buf.data, buf.last_read_pos.saturating_sub(drop_to));
+        }
+    }
+    drop(buf);
+    state.buf_cv.notify_all();
+}
+
+// -- TerminalManager ---------------------------------------------------------
 
 #[derive(Clone, Default)]
 pub struct TerminalManager {
@@ -463,6 +607,19 @@ impl TerminalManager {
 
     pub fn list(&self) -> Vec<Arc<TerminalSession>> {
         self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    // Drop sessions whose reader thread has exited (shell closed), so their
+    // output buffers do not linger for the lifetime of the server.
+    pub fn cleanup_dead(&self) {
+        let mut map = self.sessions.lock().unwrap();
+        let dead: Vec<String> = map.iter()
+            .filter(|(_, s)| !s.alive())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in dead {
+            if let Some(s) = map.remove(&id) { s.close(); }
+        }
     }
 
     pub fn cleanup_idle(&self, idle_ms: i64) {

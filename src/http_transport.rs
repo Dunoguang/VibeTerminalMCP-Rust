@@ -84,23 +84,33 @@ async fn handle_any(
         }
     };
 
-    // Single or batch request
+    // Single or batch request.
+    // handle_request is synchronous and terminal_wait can block for up to
+    // 115 s. Running it inline would pin a tokio worker for that whole time
+    // and stall every other request, so hand it to the blocking pool.
     let is_initialize = req_json.get("method").and_then(|v| v.as_str()) == Some("initialize");
-    let resp = if req_json.is_array() {
-        let responses: Vec<Value> = req_json.as_array().unwrap().iter()
-            .filter_map(|r| ctx.app.handle_request(r))
-            .collect();
-        if responses.is_empty() {
+    let app = ctx.app.clone();
+    let req_task = req_json.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        if req_task.is_array() {
+            let responses: Vec<Value> = req_task.as_array().unwrap().iter()
+                .filter_map(|r| app.handle_request(r))
+                .collect();
+            if responses.is_empty() { None } else { Some(Value::Array(responses)) }
+        } else {
+            app.handle_request(&req_task)
+        }
+    }).await;
+
+    let resp = match joined {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // notification
             return Response::builder().status(StatusCode::NO_CONTENT).body(axum::body::Body::empty()).unwrap();
         }
-        Value::Array(responses)
-    } else {
-        match ctx.app.handle_request(&req_json) {
-            Some(r) => r,
-            None => {
-                // notification
-                return Response::builder().status(StatusCode::NO_CONTENT).body(axum::body::Body::empty()).unwrap();
-            }
+        Err(e) => {
+            warn!("blocking task failed: {e}");
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, -32603, "internal task error");
         }
     };
 

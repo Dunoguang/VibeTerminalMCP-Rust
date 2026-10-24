@@ -21,8 +21,8 @@ Successor to the C++ [VibeTerminalMCP](https://github.com/Dunoguang/VibeTerminal
 | `terminal_new` | Spawn a persistent PTY bash session with custom dimensions/env/cwd. |
 | `terminal_add_cmd` | Send string/keystrokes to the terminal session (with optional auto-enter). |
 | `terminal_wait` | Wait for command completion (marker mode with exit code, or prompt mode). |
-| `terminal_line` | Slice terminal output by line range (1-based, 4KB capped). |
-| `terminal_last` | Retrieve new output since last query (4KB capped). |
+| `terminal_line` | Slice terminal output by line range (1-based; `max_bytes`, default 4 KB, up to 1 MB). |
+| `terminal_last` | Retrieve new output since last query (incremental; `max_bytes`, default 4 KB, up to 1 MB). |
 | `terminal_timeout` | Read output after waiting `n` milliseconds. |
 | `terminal_kill` | Terminate and clean up a session. |
 | `terminal_list` | List active sessions, idle times, and recent output. |
@@ -57,3 +57,18 @@ Options:
 ## License
 
 [MIT](LICENSE) © 2026 Dunoguang
+
+## Output buffering
+
+Each session keeps the newest 4 MB of output. Reads are incremental:
+`terminal_last` returns everything not returned yet, in order, and reports the
+remaining byte count in `structuredContent.unread`, so a large burst can be
+paged with repeated calls instead of being discarded. If more than 4 MB has been
+produced, the oldest bytes are dropped and the next read starts with
+`=== dropped N bytes ===`.
+
+The reader drains the pty until it is empty (128 KB reads, partial UTF-8
+sequences carried across calls), so commands that produce tens of megabytes do
+not block on a full kernel pty buffer. Waits use a monotonic write counter, and
+tool calls run on the blocking pool so a 115 s `terminal_wait` cannot pin a
+tokio worker.

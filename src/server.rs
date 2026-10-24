@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::terminal::TerminalManager;
-use crate::util::{audit_log_json, finalize_output, now_ms};
+use crate::util::{audit_log_json, clip_head, finalize_output, finalize_output_limit, now_ms, MAX_TAKE_BYTES};
 
 // ── Tool schema helpers ───────────────────────────────────────────────────────
 
@@ -53,6 +53,8 @@ impl AppState {
     }
 
     pub fn tools(&self) -> &Value { &self.tools_json }
+    pub fn cleanup_dead(&self) { self.manager.cleanup_dead(); }
+
 
     /// Handle a JSON-RPC 2.0 request. Returns (Option<response>, is_notification).
     pub fn handle_request(&self, req: &Value) -> Option<Value> {
@@ -153,13 +155,12 @@ impl AppState {
         let session = session_or_err(&self.manager, args, "terminal_line")?;
         let start = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
         let end = args.get("end_line").and_then(|v| v.as_i64()).unwrap_or(-1);
-        let all = session.read_all();
-        let lines: Vec<&str> = all.split('\n').collect();
-        let total = lines.len();
-        let lo = start.saturating_sub(1).min(total);
-        let hi = if end < 0 { total } else { (end as usize).min(total) };
-        let out = if lo < hi { lines[lo..hi].join("\n") } else { String::new() };
-        let out = finalize_output(out);
+        let max_bytes = args.get("max_bytes").and_then(|v| v.as_u64())
+            .unwrap_or(4096).clamp(256, MAX_TAKE_BYTES as u64) as usize;
+        let range_end = if end < 0 { usize::MAX } else { end as usize };
+        // read_lines walks the shared buffer directly; no full clone.
+        let out = session.read_lines(start, range_end);
+        let out = clip_head(out, max_bytes);
         audit_log_json("terminal_line", args.get("reason").and_then(|v| v.as_str()).unwrap_or(""), args, "ok");
         Ok(ok_text(out))
     }
@@ -167,9 +168,24 @@ impl AppState {
     fn tool_terminal_last(&self, args: &Value) -> Result<Value, Value> {
         if let Some(e) = missing_reason(args, "terminal_last") { return Err(e); }
         let session = session_or_err(&self.manager, args, "terminal_last")?;
-        let out = finalize_output(session.read_last());
+        let max_bytes = args.get("max_bytes").and_then(|v| v.as_u64())
+            .unwrap_or(4096).clamp(256, MAX_TAKE_BYTES as u64) as usize;
+        // Incremental: the cursor only advances over what is returned, so a
+        // large burst can be paged instead of silently dropped.
+        let (text, left, dropped) = session.read_last(max_bytes);
+        let mut out = finalize_output_limit(text, max_bytes);
+        if dropped > 0 {
+            out = format!("=== dropped {} bytes ===\n{}", dropped, out);
+        }
+        if left > 0 {
+            out.push_str(&format!("\n=== {} bytes unread, call terminal_last again ===\n", left));
+        }
         audit_log_json("terminal_last", args.get("reason").and_then(|v| v.as_str()).unwrap_or(""), args, "ok");
-        Ok(ok_text(out))
+        Ok(json!({
+            "content": [{"type": "text", "text": out}],
+            "isError": false,
+            "structuredContent": { "unread": left, "dropped": dropped }
+        }))
     }
 
     fn tool_terminal_wait(&self, args: &Value) -> Result<Value, Value> {
@@ -200,7 +216,8 @@ impl AppState {
         let session = session_or_err(&self.manager, args, "terminal_timeout")?;
         let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(5000).min(115000);
         std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-        let out = finalize_output(session.read_last());
+        let (text, _left, _dropped) = session.read_last(4096);
+        let out = finalize_output(text);
         audit_log_json("terminal_timeout", args.get("reason").and_then(|v| v.as_str()).unwrap_or(""), args, "ok");
         Ok(ok_text(out))
     }
@@ -286,26 +303,28 @@ fn build_tools_list() -> Value {
       },
       {
         "name": "terminal_line",
-        "description": "获取终端输出第 a-b 行内容 (1-based, 最多 4KB)",
+        "description": "获取终端输出第 a-b 行内容 (1-based, 最多 4KB), max_bytes up to 1MB",
         "inputSchema": {
           "type": "object",
           "properties": {
             "reason":     { "type": "string",  "description": "操作理由（必填，用于审计）" },
             "session_id": { "type": "string",  "description": "终端会话 ID" },
             "start_line": { "type": "integer", "description": "起始行 (1-based) (default: 1)" },
-            "end_line":   { "type": "integer", "description": "结束行 (-1=到最后) (default: -1)" }
+            "end_line":   { "type": "integer", "description": "结束行 (-1=到最后) (default: -1)" },
+            "max_bytes":  { "type": "integer", "description": "Max bytes returned (default: 4096, up to 1048576)" }
           },
           "required": ["session_id", "reason"]
         }
       },
       {
         "name": "terminal_last",
-        "description": "获取终端自上次查询以来的新输出 (最多 4KB)",
+        "description": "获取终端自上次查询以来的新输出 (最多 4KB), max_bytes up to 1MB",
         "inputSchema": {
           "type": "object",
           "properties": {
             "reason":     { "type": "string", "description": "操作理由（必填，用于审计）" },
-            "session_id": { "type": "string", "description": "终端会话 ID" }
+            "session_id": { "type": "string", "description": "终端会话 ID" },
+            "max_bytes":  { "type": "integer", "description": "Max bytes returned (default: 4096, up to 1048576)" }
           },
           "required": ["session_id", "reason"]
         }
