@@ -158,9 +158,18 @@ impl AppState {
         let max_bytes = args.get("max_bytes").and_then(|v| v.as_u64())
             .unwrap_or(4096).clamp(256, MAX_TAKE_BYTES as u64) as usize;
         let range_end = if end < 0 { usize::MAX } else { end as usize };
-        // read_lines walks the shared buffer directly; no full clone.
-        let out = session.read_lines(start, range_end);
-        let out = clip_head(out, max_bytes);
+        // read_lines walks the shared buffer directly and stops at max_bytes.
+        let (out, more) = session.read_lines(start, range_end, max_bytes);
+        let mut out = out;
+        // clip_head strips ANSI first, which can shrink the text below the
+        // limit even though read_lines did stop early, so key the notice off
+        // `more` as well instead of only the post-strip length.
+        if more || out.len() > max_bytes {
+            out = clip_head(out, max_bytes);
+            if more && !out.contains("bytes follow") {
+                out.push_str("\n=== more lines follow ===\n");
+            }
+        }
         audit_log_json("terminal_line", args.get("reason").and_then(|v| v.as_str()).unwrap_or(""), args, "ok");
         Ok(ok_text(out))
     }
@@ -303,7 +312,7 @@ fn build_tools_list() -> Value {
       },
       {
         "name": "terminal_line",
-        "description": "获取终端输出第 a-b 行内容 (1-based, 最多 4KB), max_bytes up to 1MB",
+        "description": "获取终端输出第 a-b 行内容 (1-based, 最多 4KB), max_bytes up to 64KB",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -311,20 +320,20 @@ fn build_tools_list() -> Value {
             "session_id": { "type": "string",  "description": "终端会话 ID" },
             "start_line": { "type": "integer", "description": "起始行 (1-based) (default: 1)" },
             "end_line":   { "type": "integer", "description": "结束行 (-1=到最后) (default: -1)" },
-            "max_bytes":  { "type": "integer", "description": "Max bytes returned (default: 4096, up to 1048576)" }
+            "max_bytes":  { "type": "integer", "description": "Max bytes returned (default: 4096, up to 65536)" }
           },
           "required": ["session_id", "reason"]
         }
       },
       {
         "name": "terminal_last",
-        "description": "获取终端自上次查询以来的新输出 (最多 4KB), max_bytes up to 1MB",
+        "description": "获取终端自上次查询以来的新输出 (最多 4KB), max_bytes up to 64KB",
         "inputSchema": {
           "type": "object",
           "properties": {
             "reason":     { "type": "string", "description": "操作理由（必填，用于审计）" },
             "session_id": { "type": "string", "description": "终端会话 ID" },
-            "max_bytes":  { "type": "integer", "description": "Max bytes returned (default: 4096, up to 1048576)" }
+            "max_bytes":  { "type": "integer", "description": "Max bytes returned (default: 4096, up to 65536)" }
           },
           "required": ["session_id", "reason"]
         }

@@ -308,13 +308,19 @@ impl TerminalSession {
         (out, left, dropped)
     }
 
-    pub fn read_lines(&self, a: usize, b: usize) -> String {
+    // Walk the lines lazily and stop as soon as `limit` bytes are gathered,
+    // so asking for a huge range never materialises the whole buffer.
+    // Returns (text, more). `more` is true when the byte limit or `b` stopped
+    // the walk before the requested range ended, so the caller can say so
+    // instead of silently looking like the end of the buffer.
+    pub fn read_lines(&self, a: usize, b: usize, limit: usize) -> (String, bool) {
         let buf = self.state.buf.lock().unwrap();
-        if a < 1 { return "(no output)".into(); }
-        // Walk the lines without building a Vec of every line in the buffer.
+        if a < 1 { return ("(no output)".into(), false); }
+        let limit = limit.max(256);
         let mut out = String::new();
         let mut found = false;
         let mut idx = 0usize;
+        let mut more = false;
         for line in buf.data.split('\n') {
             idx += 1;
             if idx < a { continue; }
@@ -322,8 +328,9 @@ impl TerminalSession {
             if found { out.push('\n'); }
             out.push_str(line);
             found = true;
+            if out.len() >= limit { more = true; break; }
         }
-        if !found { "(no output)".into() } else { out }
+        if !found { ("(no output)".into(), false) } else { (out, more) }
     }
 
     // marker mode: send "echo __DONE_x__:$?" and wait for the numeric exit code
@@ -382,6 +389,19 @@ impl TerminalSession {
                     hit
                 };
                 if let Some(v) = hit { ec = v; found = true; break; }
+            }
+        }
+
+        // Let the reader catch up. The marker only proves the shell ran the
+        // command; bytes produced just before it may still sit in the pty
+        // buffer, which used to make the first read after wait look short.
+        if found {
+            let t0 = now_ms();
+            loop {
+                let w0 = self.state.buf.lock().unwrap().written;
+                thread::sleep(Duration::from_millis(30));
+                let w1 = self.state.buf.lock().unwrap().written;
+                if w1 == w0 || now_ms() - t0 > 500 { break; }
             }
         }
 

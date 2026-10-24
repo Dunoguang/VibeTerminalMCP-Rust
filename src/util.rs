@@ -101,7 +101,7 @@ pub fn finalize_output(mut s: String) -> String {
     s
 }
 
-pub const MAX_TAKE_BYTES: usize = 1024 * 1024;
+pub const MAX_TAKE_BYTES: usize = 64 * 1024;
 
 fn floor_char(s: &str, mut i: usize) -> usize {
     if i >= s.len() { return s.len(); }
